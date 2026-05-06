@@ -67,16 +67,3 @@ Render the Quarto file:
 ```bash
 quarto render seasonal-affective-streaming.qmd
 ```
-
-## GitHub Pages
-
-To publish the report as a project page:
-
-1. Open the repository settings.
-2. Go to **Pages**.
-3. Set the source to the main branch and root folder.
-4. Open the generated Pages URL. It will load `index.html`, which redirects to `seasonal-affective-streaming.html`.
-
-## Repository Notes
-
-This repo is designed to show the final analysis clearly without committing local R sessions, installed packages, scratch files, or large raw data.
