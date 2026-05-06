@@ -4,6 +4,14 @@ An independent data visualisation project exploring whether seasonal change appe
 
 The central idea is simple: culture sets each country's baseline listening mood, while geography appears to shape the size and timing of its seasonal swing.
 
+## View The Report
+
+Open the rendered report directly from this repository:
+
+- `seasonal-affective-streaming.html`
+
+If GitHub Pages is enabled, `index.html` redirects to the report automatically.
+
 ## Project Outputs
 
 - `seasonal-affective-streaming.qmd` contains the full Quarto analysis.
@@ -60,9 +68,9 @@ Render the Quarto file:
 quarto render seasonal-affective-streaming.qmd
 ```
 
-## Suggested GitHub Pages Setup
+## GitHub Pages
 
-After pushing the project to GitHub:
+To publish the report as a project page:
 
 1. Open the repository settings.
 2. Go to **Pages**.

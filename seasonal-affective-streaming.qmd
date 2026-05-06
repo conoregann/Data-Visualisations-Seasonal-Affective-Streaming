@@ -1,5 +1,5 @@
 ---
-title: "CMPU4091 Independent Project: Seasonal Affective Streaming"
+title: "Seasonal Affective Streaming"
 author: "Conor Egan"
 format:
   html:
