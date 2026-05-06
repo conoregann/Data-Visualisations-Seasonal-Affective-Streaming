@@ -1,0 +1,876 @@
+---
+title: "CMPU4091 Independent Project: Seasonal Affective Streaming"
+author: "Conor Egan"
+format:
+  html:
+    self-contained: true
+    code-fold: true
+    code-copy: true
+    toc: true
+    toc-depth: 3
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: source
+---
+
+## Introduction
+
+This project explores whether seasonal changes are reflected in the type of music people stream. Using Spotify Top 200 data from 2021 to 2022, I compare countries in the Northern and Southern Hemispheres to test whether local weather climates shape musical climates.
+
+The analysis first prepares the raw track-level data into country-week summaries, then uses exploratory visualisations to identify patterns, and finally presents explanatory charts that communicate the seasonal mood shift clearly.
+
+## Project Setup
+
+This section loads the packages and Spotify dataset used throughout the analysis.
+
+### Step 1: Load Required Libraries
+
+The analysis uses `tidyverse` for data manipulation and visualisation, and `lubridate` for working with weekly date values.
+
+```{r}
+# Data Loading
+
+# Use the project-local library for any packages installed with this project.
+if (dir.exists(".Rlibs")) {
+  .libPaths(c(normalizePath(".Rlibs"), .libPaths()))
+}
+
+# 1. Load necessary libraries
+# We use lubridate (part of tidyverse) to handle the dates beautifully
+library(tidyverse)
+library(lubridate)
+library(hexbin)
+library(plotly)
+library(crosstalk)
+library(htmltools)
+library(ggrepel)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+```
+
+### Step 2: Load the Spotify Dataset
+
+The raw streaming dataset is imported from the `Data` folder so it can be cleaned and prepared for analysis.
+
+```{r}
+# 2. Load the dataset
+# Update the filename to whatever you named your CSV in the data folder
+spotify_raw <- read_csv("Data/spotify_data.csv", show_col_types = FALSE)
+```
+
+### Step 3: Inspect the Raw Data
+
+A quick structure check confirms the available columns, data types, and overall shape of the dataset before any transformations are applied.
+
+```{r}
+# Quick check of the data structure
+glimpse(spotify_raw)
+
+```
+
+## Data Preparation
+
+This section focuses the dataset on countries from both hemispheres, assigns seasonal labels, and creates the final weekly summary table used for visualisation.
+
+### Step 4: Define Hemisphere Comparison Groups
+
+Countries are grouped into Northern and Southern Hemisphere samples so that seasonal listening behaviour can be compared across opposite calendar seasons.
+
+The Northern Hemisphere sample includes Norway, Sweden, Finland, Denmark, Iceland, Ireland, the United Kingdom, Germany, France, Spain, Switzerland, and Canada.
+
+The Southern Hemisphere sample includes Australia, New Zealand, Argentina, Ecuador, Chile, Brazil, Uruguay, Paraguay, Peru, and Bolivia.
+
+```{r}
+# Cleaning, Hemispheres, and Seasons
+
+# 1. Define our target countries for a clear seasonal story
+northern_countries <- c(
+  "Norway", "Sweden", "Finland", "Denmark", "Iceland",
+  "Ireland", "United Kingdom", "Germany", "France", "Spain",
+  "Switzerland", "Canada"
+)
+
+southern_countries <- c(
+  "Australia", "New Zealand", "Argentina", "Ecuador",
+  "Chile", "Brazil", "Uruguay", "Paraguay", "Peru", "Bolivia"
+)
+
+# Latitude data for the "Volume Knob" regression
+country_latitudes <- tibble(
+  country = c(
+    "Norway", "Sweden", "Finland", "Denmark", "Iceland", "Ireland",
+    "United Kingdom", "Germany", "France", "Spain", "Switzerland", "Canada",
+    "Australia", "New Zealand", "Argentina", "Ecuador", "Chile",
+    "Brazil", "Uruguay", "Paraguay", "Peru", "Bolivia"
+  ),
+  # Approximate central latitudes for each country
+  latitude = c(
+    60.4, 60.1, 61.9, 56.2, 64.9, 53.1,
+    55.3, 51.1, 46.2, 40.4, 46.8, 56.1,
+    -25.2, -40.9, -38.4, -1.8, -35.6,
+    -14.2, -32.5, -23.2, -9.1, -16.2
+  )
+) %>%
+  # Absolute latitude is the distance from the equator
+  mutate(abs_latitude = abs(latitude))
+```
+
+### Step 5: Clean the Data and Assign Seasons
+
+The dataset is filtered to the selected countries, missing values are removed, weekly dates are parsed, and each observation is labelled with the correct hemisphere and season.
+
+```{r}
+# 2. Clean and Transform the Data
+spotify_clean <- spotify_raw %>%
+  
+  # Filter only to our target countries (and remove missing stream/valence data)
+  filter(country %in% c(northern_countries, southern_countries)) %>%
+  filter(!is.na(streams), !is.na(valence)) %>%
+  
+  # Parse the week column into a proper Date format
+  mutate(week_date = ymd(week)) %>%
+  
+  # Assign the Hemisphere based on the country
+  mutate(
+    Hemisphere = case_when(
+      country %in% northern_countries ~ "North",
+      country %in% southern_countries ~ "South"
+    ),
+    
+    # Extract the month number (1 to 12) from the date
+    month_num = month(week_date),
+    
+    # THE CRUCIAL LOGIC: Assign Season based on Hemisphere AND Month
+    Season = case_when(
+      Hemisphere == "North" & month_num %in% c(12, 1, 2) ~ "Winter",
+      Hemisphere == "North" & month_num %in% c(3, 4, 5)  ~ "Spring",
+      Hemisphere == "North" & month_num %in% c(6, 7, 8)  ~ "Summer",
+      Hemisphere == "North" & month_num %in% c(9, 10, 11)~ "Autumn",
+      
+      Hemisphere == "South" & month_num %in% c(12, 1, 2) ~ "Summer",
+      Hemisphere == "South" & month_num %in% c(3, 4, 5)  ~ "Autumn",
+      Hemisphere == "South" & month_num %in% c(6, 7, 8)  ~ "Winter",
+      Hemisphere == "South" & month_num %in% c(9, 10, 11)~ "Spring"
+    )
+  )
+```
+
+### Step 6: Filter Holiday Outliers and Aggregate Weekly Listening Mood
+
+The cleaned song-level data is first filtered to remove the Christmas and New Year holiday period, then summarised into country-week averages. Weighted means are used so that songs with more streams have a larger influence on the overall listening mood.
+
+```{r}
+# 3. Aggregate to the Country-Week level
+# We use a WEIGHTED MEAN based on streams. A song with 10M streams 
+# represents the "mood" much more than a song with 50k streams.
+spotify_agg <- spotify_clean %>%
+  # Filter out the Christmas/New Year outlier weeks (Dec 20 to Jan 5).
+  # This prevents holiday music spikes from distorting the winter average.
+  mutate(
+    is_holiday = (month_num == 12 & day(week_date) >= 20) |
+      (month_num == 1 & day(week_date) <= 5)
+  ) %>%
+  filter(is_holiday == FALSE) %>%
+  
+  group_by(country, Hemisphere, Season, week_date, month_num) %>%
+  summarise(
+    avg_valence = weighted.mean(valence, w = streams, na.rm = TRUE),
+    avg_energy = weighted.mean(energy, w = streams, na.rm = TRUE),
+    avg_acousticness = weighted.mean(acousticness, w = streams, na.rm = TRUE),
+    total_streams = sum(streams, na.rm = TRUE),
+    .groups = "drop" # Drops grouping to prevent issues later
+  )
+```
+
+### Step 7: Preview the Final Analysis Dataset
+
+The resulting table is checked to confirm that the cleaned and aggregated dataset is ready for plotting.
+
+```{r}
+# View the final, clean dataset ready for plotting!
+head(spotify_agg)
+```
+
+## Exploratory Analysis
+
+Before creating the final visual narrative, I explored the dataset to understand the distribution, relationships, and underlying structure of the audio features.
+
+### Exploratory Chart 1: The Cultural Ladder (Baseline Differences)
+
+```{r exploratory-1, fig.height=7}
+ggplot(
+  spotify_agg,
+  aes(x = reorder(country, avg_valence, FUN = median), y = avg_valence)
+) +
+  geom_boxplot(fill = "lightblue", outlier.alpha = 0.3) +
+  coord_flip() +
+  labs(
+    title = "Baseline Valence Distribution by Country",
+    x = "Country",
+    y = "Average Valence"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+Sorting countries by median valence reveals a clear cultural ladder, with South American countries sitting higher and Northern or Anglophone countries lower. This shows that any seasonal effect must be judged against a country's own baseline rather than a global average.
+
+### Exploratory Chart 2: Seasonal Audio Feature Comparison
+
+```{r exploratory-2, fig.height=8}
+# Compare multiple audio features across seasons and hemispheres
+seasonal_features <- spotify_agg %>%
+  select(country, Hemisphere, Season, avg_valence, avg_energy, avg_acousticness) %>%
+  pivot_longer(
+    cols = c(avg_valence, avg_energy, avg_acousticness),
+    names_to = "feature",
+    values_to = "value"
+  ) %>%
+  mutate(
+    Season = factor(Season, levels = c("Winter", "Spring", "Summer", "Autumn")),
+    feature = recode(
+      feature,
+      avg_valence = "Valence",
+      avg_energy = "Energy",
+      avg_acousticness = "Acousticness"
+    )
+  )
+
+ggplot(seasonal_features, aes(x = Season, y = value, fill = Season)) +
+  geom_boxplot(outlier.alpha = 0.2, width = 0.7) +
+  facet_grid(feature ~ Hemisphere, scales = "free_y") +
+  scale_fill_manual(
+    values = c(
+      "Winter" = "#377EB8",
+      "Spring" = "#4DAF4A",
+      "Summer" = "#FF7F00",
+      "Autumn" = "#984EA3"
+    )
+  ) +
+  labs(
+    title = "Seasonal Audio Feature Comparison",
+    subtitle = "Three audio features compared across seasons and hemispheres.",
+    x = "Season",
+    y = "Weighted Average Feature Value",
+    fill = "Season"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(angle = 30, hjust = 1),
+    strip.text = element_text(face = "bold")
+  )
+```
+
+This chart shows that the seasonal pattern is not limited to valence alone. Winter and summer also differ across energy and acousticness, which supports a broader shift in listening mood.
+
+### Exploratory Chart 3: Initial Seasonal Structure (Monthly Valence by Hemisphere)
+
+```{r exploratory-3}
+ggplot(spotify_agg, aes(x = factor(month_num), y = avg_valence, fill = Hemisphere)) +
+  geom_boxplot(color = "grey30", outlier.alpha = 0.25) +
+  facet_wrap(~Hemisphere, ncol = 1) +
+  scale_fill_manual(values = c("North" = "#377EB8", "South" = "#E41A1C")) +
+  labs(
+    title = "Monthly Valence Distribution by Hemisphere",
+    x = "Month of the Year",
+    y = "Average Valence"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+Grouping by month and hemisphere reveals an inverted seasonal structure. Northern countries dip early and late in the year, while Southern countries dip in the middle, which is consistent with opposite winter periods.
+
+### Exploratory Chart 4: Seasonal Cycle Plot (Selected Countries)
+
+```{r exploratory-4}
+# Select four countries representing different cultural baselines and hemispheres
+sample_countries <- c("Argentina", "New Zealand", "Sweden", "Norway")
+
+# Aggregate the data by month for these specific countries
+monthly_cycle <- spotify_agg %>%
+  filter(country %in% sample_countries) %>%
+  group_by(country, month_num) %>%
+  summarise(
+    avg_v = weighted.mean(avg_valence, w = total_streams, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Plot the seasonal cycle
+ggplot(monthly_cycle, aes(x = month_num, y = avg_v, color = country)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  # Convert month numbers (1-12) to abbreviated month names (Jan-Dec) for readability
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  labs(
+    title = "Annual Listening Cycles for Representative Countries",
+    x = "Month of the Year",
+    y = "Average Valence",
+    color = "Country"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "top")
+```
+
+These selected countries show both baseline differences and seasonal dips. The pattern suggests that local winter may be pulling listening mood downward.
+
+### Exploratory Chart 5: Monthly Valence Heatmap by Country
+
+```{r exploratory-5, fig.height=8}
+# Aggregate monthly valence by country
+monthly_heatmap <- spotify_agg %>%
+  group_by(country, month_num) %>%
+  summarise(
+    avg_v = weighted.mean(avg_valence, w = total_streams, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(country_latitudes, by = "country") %>%
+  mutate(
+    month_name = factor(month.abb[month_num], levels = month.abb),
+    country = fct_reorder(country, abs_latitude)
+  )
+
+ggplot(monthly_heatmap, aes(x = month_name, y = country, fill = avg_v)) +
+  geom_tile(color = "white", linewidth = 0.25) +
+  scale_fill_viridis_c(option = "magma", name = "Average\nValence") +
+  labs(
+    title = "Monthly Valence Heatmap by Country",
+    subtitle = "Rows are ordered by distance from the equator.",
+    x = "Month",
+    y = "Country"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+The heatmap shows cultural baseline and seasonality in one view. Ordering countries by latitude makes it easier to see whether stronger seasonal shifts cluster further from the equator.
+
+## Explanatory Analysis
+
+**The Big Idea:** Culture sets the baseline for a nation's musical happiness, but geography dictates its seasonal swing.
+
+After exploring the data, I use four explanatory charts to reveal and communicate the Big Idea in more detail. The seasonal mood pattern more can now be visualised more clearly. Each chart focuses on a different form of evidence: a smoothed time trend, a country-level seasonal gap, a geographic view of where the strongest shifts appear, and a latitude regression that tests the strength of that pattern.
+
+### Explanatory Chart 1: The Hemisphere Mirror (LOESS Time Series)
+
+To show that mood shifts are driven by local seasons rather than only global calendar events, I compare monthly country-level trends across the Northern and Southern Hemispheres. The country lines are muted so the smoothed hemisphere trends carry the explanatory message more clearly.
+
+```{r explanatory-1, fig.height=8}
+# Prepare country-level monthly trends for interactive filtering
+# Monthly aggregation reduces visual noise while preserving the seasonal pattern.
+country_monthly <- spotify_agg %>%
+  mutate(month_date = floor_date(week_date, unit = "month")) %>%
+  group_by(country, Hemisphere, month_date) %>%
+  summarise(
+    avg_valence = weighted.mean(avg_valence, w = total_streams, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    tooltip = paste0(
+      "Country: ", country,
+      "<br>Hemisphere: ", Hemisphere,
+      "<br>Month: ", format(month_date, "%b %Y"),
+      "<br>Average valence: ", round(avg_valence, 3)
+    )
+  )
+
+# Precompute the hemisphere LOESS lines separately from Crosstalk.
+# This keeps the North/South trends visible even when country filters are active.
+loess_trends <- country_monthly %>%
+  mutate(month_index = as.numeric(month_date)) %>%
+  group_by(Hemisphere) %>%
+  group_modify(~ {
+    date_grid <- seq(
+      min(.x$month_index, na.rm = TRUE),
+      max(.x$month_index, na.rm = TRUE),
+      length.out = 160
+    )
+    loess_fit <- loess(avg_valence ~ month_index, data = .x, span = 0.3)
+
+    tibble(
+      month_date = as.Date(date_grid, origin = "1970-01-01"),
+      avg_valence = as.numeric(predict(
+        loess_fit,
+        newdata = tibble(month_index = date_grid)
+      ))
+    )
+  }) %>%
+  ungroup() %>%
+  filter(!is.na(avg_valence))
+
+make_loess_shapes <- function(trend_data, colour) {
+  trend_data <- arrange(trend_data, month_date)
+
+  map(seq_len(nrow(trend_data) - 1), function(i) {
+    list(
+      type = "line",
+      xref = "x",
+      yref = "y",
+      x0 = as.character(trend_data$month_date[i]),
+      x1 = as.character(trend_data$month_date[i + 1]),
+      y0 = trend_data$avg_valence[i],
+      y1 = trend_data$avg_valence[i + 1],
+      layer = "above",
+      line = list(color = colour, width = 4)
+    )
+  })
+}
+
+loess_shapes <- c(
+  make_loess_shapes(filter(loess_trends, Hemisphere == "North"), "#377EB8"),
+  make_loess_shapes(filter(loess_trends, Hemisphere == "South"), "#E41A1C")
+)
+
+hemisphere_key <- tags$div(
+  style = paste(
+    "display: inline-flex;",
+    "gap: 14px;",
+    "align-items: center;",
+    "font-size: 13px;",
+    "margin-left: 16px;"
+  ),
+  tags$span(
+    tags$span(
+      style = paste(
+        "display: inline-block;",
+        "width: 10px;",
+        "height: 10px;",
+        "border-radius: 50%;",
+        "background: #377EB8;",
+        "margin-right: 6px;"
+      )
+    ),
+    "North"
+  ),
+  tags$span(
+    tags$span(
+      style = paste(
+        "display: inline-block;",
+        "width: 10px;",
+        "height: 10px;",
+        "border-radius: 50%;",
+        "background: #E41A1C;",
+        "margin-right: 6px;"
+      )
+    ),
+    "South"
+  )
+)
+
+chart_y_range <- range(
+  c(country_monthly$avg_valence, loess_trends$avg_valence),
+  na.rm = TRUE
+)
+chart_y_padding <- diff(chart_y_range) * 0.08
+
+country_trace_order <- country_monthly %>%
+  distinct(country, Hemisphere) %>%
+  arrange(Hemisphere, country)
+
+country_checkboxes <- pmap(
+  list(
+    country_trace_order$country,
+    country_trace_order$Hemisphere,
+    seq_len(nrow(country_trace_order)) - 1
+  ),
+  function(country_name, hemisphere_name, trace_index) {
+    tags$label(
+      style = paste(
+        "display: flex;",
+        "align-items: center;",
+        "gap: 6px;",
+        "margin: 4px 0;",
+        "cursor: pointer;",
+        "white-space: nowrap;"
+      ),
+      tags$input(
+        type = "checkbox",
+        class = "chart1-country-checkbox",
+        value = trace_index,
+        checked = "checked"
+      ),
+      tags$span(
+        style = paste0(
+          "display: inline-block; width: 9px; height: 9px; ",
+          "flex: 0 0 9px; border-radius: 50%; background: ",
+          if_else(hemisphere_name == "North", "#377EB8", "#E41A1C"),
+          ";"
+        )
+      ),
+      country_name
+    )
+  }
+)
+
+country_dropdown_script <- tags$script(HTML(
+  "
+  document.addEventListener('click', function(event) {
+    var details = document.querySelector('details.chart1-country-dropdown');
+    if (details && !details.contains(event.target)) {
+      details.removeAttribute('open');
+    }
+  });
+  "
+))
+country_filter_controls <- tags$details(
+  class = "chart1-country-dropdown",
+  style = "font-size: 13px; margin-bottom: 12px; position: relative;",
+  tags$summary(
+    style = paste(
+      "cursor: pointer;",
+      "font-weight: 600;",
+      "display: inline-block;",
+      "border: 1px solid #ccc;",
+      "border-radius: 4px;",
+      "padding: 6px 10px;",
+      "background: #fff;"
+    ),
+    "Countries"
+  ),
+  tags$div(
+    style = paste(
+      "position: absolute;",
+      "z-index: 10;",
+      "background: #fff;",
+      "border: 1px solid #ccc;",
+      "box-shadow: 0 4px 12px rgba(0,0,0,0.12);",
+      "padding: 10px;",
+      "margin-top: 4px;",
+      "width: min(760px, calc(100vw - 48px));"
+    ),
+    tags$button(
+      id = "chart1_select_all",
+      type = "button",
+      style = "margin: 0 6px 8px 0;",
+      "Show all"
+    ),
+    tags$button(
+      id = "chart1_clear_all",
+      type = "button",
+      style = "margin: 0 0 8px 0;",
+      "Clear"
+    ),
+    tags$div(
+      id = "chart1_country_checks",
+      style = paste(
+        "display: grid;",
+        "grid-template-columns: repeat(3, minmax(170px, 1fr));",
+        "column-gap: 18px;",
+        "max-height: 180px;",
+        "overflow-y: auto;"
+      ),
+      country_checkboxes
+    )
+  )
+)
+
+country_filter_controls <- tagList(
+  country_dropdown_script,
+  country_filter_controls
+)
+
+# Build an interactive country-level time series.
+# Individual country lines can be shown or hidden with the checkbox controls.
+# The thicker smooth lines are layout shapes, so Crosstalk filters cannot hide them.
+p1_interactive <- plotly::plot_ly()
+
+for (i in seq_len(nrow(country_trace_order))) {
+  country_name <- country_trace_order$country[i]
+  hemisphere_name <- country_trace_order$Hemisphere[i]
+  country_data <- filter(country_monthly, country == country_name)
+  line_colour <- if_else(
+    hemisphere_name == "North",
+    "rgba(55, 126, 184, 0.22)",
+    "rgba(228, 26, 28, 0.22)"
+  )
+
+  p1_interactive <- p1_interactive %>%
+    plotly::add_lines(
+      data = country_data,
+      x = ~month_date,
+      y = ~avg_valence,
+      text = ~tooltip,
+      hoverinfo = "text",
+      name = country_name,
+      line = list(color = line_colour, width = 0.8),
+      showlegend = FALSE
+    )
+}
+
+p1_interactive <- p1_interactive %>%
+  plotly::layout(
+    title = list(
+      text = "The Hemisphere Mirror"
+    ),
+    xaxis = list(
+      title = "Date",
+      range = as.character(range(country_monthly$month_date, na.rm = TRUE))
+    ),
+    yaxis = list(
+      title = "Average Valence (Happiness)",
+      range = c(
+        chart_y_range[1] - chart_y_padding,
+        chart_y_range[2] + chart_y_padding
+      )
+    ),
+    shapes = loess_shapes,
+    height = 400,
+    margin = list(t = 40, r = 25, b = 40, l = 55),
+    showlegend = FALSE
+  )
+
+tagList(
+  tags$div(
+    style = paste(
+      "display: flex;",
+      "align-items: center;",
+      "justify-content: space-between;",
+      "margin-bottom: 8px;"
+    ),
+    country_filter_controls,
+    hemisphere_key
+  ),
+  htmlwidgets::onRender(
+    p1_interactive,
+    "
+    function(el, x) {
+      var controls = document.getElementById('chart1_country_checks');
+      var selectAll = document.getElementById('chart1_select_all');
+      var clearAll = document.getElementById('chart1_clear_all');
+
+      if (!controls || !selectAll || !clearAll) return;
+
+      var boxes = Array.prototype.slice.call(
+        controls.querySelectorAll('.chart1-country-checkbox')
+      );
+
+      function updateCountryLines() {
+        var traceIndexes = boxes.map(function(box) {
+          return Number(box.value);
+        });
+        var visibility = boxes.map(function(box) {
+          return box.checked;
+        });
+
+        Plotly.restyle(el, {'visible': visibility}, traceIndexes);
+      }
+
+      boxes.forEach(function(box) {
+        box.addEventListener('change', updateCountryLines);
+      });
+
+      selectAll.addEventListener('click', function() {
+        boxes.forEach(function(box) {
+          box.checked = true;
+        });
+        updateCountryLines();
+      });
+
+      clearAll.addEventListener('click', function() {
+        boxes.forEach(function(box) {
+          box.checked = false;
+        });
+        updateCountryLines();
+      });
+    }
+    "
+  )
+)
+```
+
+The muted country lines preserve variation in the data, but the two smoothed trends make the main point much easier to read. The North dips around its winter months, while the South falls later in the year, producing the mirrored seasonal pattern that underpins the full argument.
+
+### Explanatory Chart 2: The Seasonal Gap (Dumbbell Plot)
+
+To explicitly measure how much each country shifts between seasons, this dumbbell plot visualises the gap in listening mood between summer and winter, sorted by distance from the equator.
+
+```{r explanatory-2, fig.height=9}
+# Isolate Summer and Winter averages per country for reuse in later charts
+season_summary <- spotify_agg %>%
+  filter(Season %in% c("Winter", "Summer")) %>%
+  group_by(country, Hemisphere, Season) %>%
+  summarise(
+    # Use total_streams as the weight for this second aggregation
+    avg_v = weighted.mean(avg_valence, w = total_streams, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Prepare data for the dumbbell plot
+# Latitude is joined so countries can be sorted by distance from the equator
+dumbbell_data <- season_summary %>%
+  select(country, Hemisphere, Season, avg_v) %>%
+  pivot_wider(names_from = Season, values_from = avg_v) %>%
+  left_join(country_latitudes, by = "country") %>%
+  # Sort countries by absolute latitude so the seasonal gaps can be compared geographically
+  mutate(country = fct_reorder(country, abs_latitude))
+
+# Build the dumbbell plot
+ggplot(dumbbell_data) +
+  # Draw the connecting line (the seasonal gap)
+  geom_segment(
+    aes(y = country, yend = country, x = Winter, xend = Summer),
+    color = "grey80",
+    linewidth = 1.8
+  ) +
+  
+  # Draw the Winter and Summer points
+  geom_point(aes(y = country, x = Winter, color = "Winter"), size = 4) +
+  geom_point(aes(y = country, x = Summer, color = "Summer"), size = 4) +
+  
+  # Facet by Hemisphere for regional context
+  facet_wrap(~Hemisphere, scales = "free_y", ncol = 1) +
+  
+  scale_color_manual(values = c("Winter" = "#377EB8", "Summer" = "#FF7F00"), name = "Season") +
+  
+  labs(
+    title = "The Seasonal Gap: Summer vs. Winter Listening Mood",
+    subtitle = "Countries are ordered by distance from the equator.",
+    x = "Average Valence (Musical Happiness)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    legend.position = "top",
+    strip.text = element_text(face = "bold"),
+    axis.text.y = element_text(size = 11),
+    panel.spacing.y = unit(1.2, "lines")
+  )
+```
+
+The dumbbell plot provides the most direct comparison of the seasonal shift. By sorting countries by latitude, the larger gaps become easier to spot among higher-latitude countries, while shorter lines suggest a more stable listening mood across the year.
+
+### Explanatory Chart 3: The Seasonal Swing Map (Choropleth)
+
+Finally, I test whether geography helps explain the size of the seasonal mood shift. This choropleth map translates the seasonal pattern into geographic space by plotting the "swing" in valence between each country's summer and winter.
+
+```{r explanatory-3, fig.height=6.5, fig.width=10}
+# Calculate the seasonal swing
+swing_data <- season_summary %>%
+  pivot_wider(names_from = Season, values_from = avg_v) %>%
+  mutate(
+    Valence_Swing = Summer - Winter
+  ) %>%
+  # Join our latitude data
+  left_join(country_latitudes, by = "country") %>%
+  # Add map naming for the following geospatial chart
+  mutate(map_country = country)
+
+# Load world map data and project to Web Mercator
+world <- ne_countries(scale = "medium", returnclass = "sf")
+world_merc <- st_transform(world, 3857)
+
+# Join Spotify data to the map
+map_data <- world_merc %>%
+  left_join(swing_data, by = c("name" = "map_country"))
+
+# Keep only the countries included in the Spotify analysis
+map_data_filtered <- map_data %>%
+  filter(!is.na(Valence_Swing))
+
+# Plot the choropleth map
+ggplot(map_data) +
+  # Base layer
+  geom_sf(fill = "grey95", color = "white", linewidth = 0.15) +
+  
+  # Spotify data layer
+  geom_sf(
+    data = map_data_filtered,
+    aes(fill = Valence_Swing),
+    color = "grey25",
+    linewidth = 0.3
+  ) +
+  
+  # Accessible, colour-blind friendly palette
+  scale_fill_viridis_c(
+    option = "magma",
+    begin = 0.15,
+    end = 0.95,
+    name = "Valence swing\n(Summer - Winter)"
+  ) +
+  coord_sf(
+    xlim = c(-15000000, 20000000),
+    ylim = c(-7000000, 10000000),
+    expand = FALSE,
+    datum = NA
+  ) +
+  
+  labs(
+    title = "The Seasonal Swing Map: Global Mood Swings",
+    subtitle = "Lighter countries show a larger gap between summer and winter listening mood."
+  ) +
+  theme_void(base_size = 14) +
+  theme(legend.position = "right")
+```
+
+The map translates the seasonal pattern into geographic space by showing where the strongest and weakest mood swings appear. Countries with lighter shading show a larger gap between summer and winter listening mood, while darker countries remain more stable across the year.
+
+### Explanatory Chart 4: Geography as the "Volume Knob" (Latitude Regression)
+
+Does physical geography predict the intensity of seasonal mood swings? To test this, I plotted each country's absolute latitude, meaning distance from the equator, against its seasonal swing in valence.
+
+```{r explanatory-4, fig.width=10}
+# Create a stable annotation point on the fitted regression line
+latitude_model <- lm(Valence_Swing ~ abs_latitude, data = swing_data)
+trend_x <- 45
+trend_y <- predict(latitude_model, newdata = tibble(abs_latitude = trend_x))
+label_x <- min(swing_data$abs_latitude, na.rm = TRUE) + 3
+label_y <- max(swing_data$Valence_Swing, na.rm = TRUE) - 0.003
+
+# Build the regression scatterplot
+ggplot(swing_data, aes(x = abs_latitude, y = Valence_Swing)) +
+  
+  # 1. Add the regression line with confidence interval
+  geom_smooth(
+    method = "lm",
+    color = "black",
+    fill = "grey80",
+    alpha = 0.5,
+    linetype = "dashed"
+  ) +
+  
+  # 2. Add the points, coloured by Hemisphere
+  geom_point(aes(color = Hemisphere), size = 4, alpha = 0.8) +
+  scale_color_manual(values = c("North" = "#377EB8", "South" = "#E41A1C")) +
+
+  # 4. Annotate the main relationship without obscuring the labelled points
+  annotate(
+    "label",
+    x = label_x,
+    y = label_y,
+    label = "Higher latitude\nusually means a\nlarger seasonal swing",
+    hjust = 0,
+    size = 3.2,
+    fill = alpha("white", 0.85)
+  ) +
+  annotate(
+    "segment",
+    x = label_x + 11,
+    xend = trend_x,
+    y = label_y - 0.004,
+    yend = trend_y,
+    arrow = arrow(length = unit(0.1, "inches")),
+    color = "grey30"
+  ) +
+  
+  labs(
+    title = "Geography as the Volume Knob: Latitude vs. Mood Swing",
+    subtitle = "Seasonal swings generally increase with latitude.",
+    x = "Absolute Latitude (Degrees from Equator)",
+    y = "Valence Swing (Summer - Winter)",
+    color = "Hemisphere"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+The annotation highlights the main regression pattern: as distance from the equator increases, the seasonal mood swing tends to increase. The labelled points still show useful variation around the trendline, reminding us that geography shapes the pattern but does not explain every country perfectly.
+
+## Uncertainty and Limitations
+
+This analysis captures only Spotify's Top 200 tracks, so lower-stream, niche, or genre-specific listening that may be more sensitive to mood is left out. The latitude regression shows a relationship, but it cannot prove that climate causes the shift, because cultural trends, national music industries, and streaming recommendation systems may also shape the pattern. Aggregating to country level also hides regional and demographic differences within each nation. The data covers only 2021 to 2022, which overlaps with the COVID period and may have affected listening habits. Filtering the holiday period helps remove one known distortion, but other recurring cultural events are still present.

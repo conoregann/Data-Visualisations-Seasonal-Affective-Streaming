@@ -1,0 +1,24 @@
+# macOS and editor noise
+.DS_Store
+.Rhistory
+.RData
+.Rproj.user/
+
+# Local package/library folders
+.Rlibs/
+renv/library/
+
+# Large local data
+Data/*.csv
+Data/*.zip
+Data/*.parquet
+Data/*.rds
+
+# Quarto/R generated support files
+*_files/
+/.quarto/
+
+# Unrelated scratch/export work
+scratch_presentation_sources/
+physical_ai_enterprise_deck/
+
